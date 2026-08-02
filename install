@@ -96,17 +96,29 @@ done
 #    inherited from the sending side and would NOT survive a rebuild from this
 #    repo -- so the property is asserted below for those too.
 for d in "${CONFIG_DATASETS[@]}"; do
+    created=
     if ! zfs list -H -o name "tank/$d" >/dev/null 2>&1; then
         zfs create -p "tank/$d"
-        if command -v zfs-auto-snapshot >/dev/null; then
-            zfs-auto-snapshot --label=monthly --keep=12 "tank/$d" >/dev/null 2>&1 || true
-        fi
+        created=1
     fi
     # Asserted every run, not just on creation: `received` is not `local`, and a
     # rebuilt host would otherwise have no policy at all while looking correct.
+    #
+    # This MUST come before the first snapshot below. zfs-auto-snapshot honours
+    # com.sun:auto-snapshot:<label>, and a freshly created dataset inherits
+    # `false` from tank -- so taking the snapshot first silently does nothing and
+    # the dataset then sits with a correct-looking property and no snapshot,
+    # which means zfs-backup skips it entirely ("no local snapshots").
     if [ "$(zfs get -H -o source com.sun:auto-snapshot:monthly "tank/$d")" != local ]; then
         zfs set com.sun:auto-snapshot:monthly=true "tank/$d"
         echo "install: set local monthly snapshot policy on tank/$d" >&2
+    fi
+    # A dataset with zero snapshots is never replicated, so give a new one its
+    # first immediately rather than waiting up to a month for the timer.
+    if [ -n "$created" ] || [ "$(zfs list -H -t snapshot -o name "tank/$d" 2>/dev/null | wc -l)" -eq 0 ]; then
+        if command -v zfs-auto-snapshot >/dev/null; then
+            zfs-auto-snapshot --label=monthly --keep=12 "tank/$d" >/dev/null 2>&1 || true
+        fi
     fi
 done
 
