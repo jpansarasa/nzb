@@ -165,9 +165,27 @@ asserts that property **locally** on every run: they previously carried it with
 source `received`, inherited from the sending side, which meant a rebuilt host
 would have had no policy at all while `zfs get` still showed `true`.
 
-`tank/downloads` is deliberately **not** snapshotted. It is a 692 GB handoff area
-whose contents are transient by design; snapshots would pin every completed and
-deleted download, and the data is re-acquirable.
+`tank/downloads` is deliberately **not** snapshotted and **not** replicated, and
+it is worth being precise about why, because it is not simply scratch. It is two
+things: the handoff area between sabnzbd and sonarr/radarr, and the shared
+**recycle bin** those two use for soft deletes. The recycle bin is the larger
+part by a wide margin — 634 GB of the 692 GB, holding deletions going back to
+August 2023.
+
+It stays local because it is a convenience layer on top of protection that
+already exists, not a backup in its own right. Anything deleted from the media
+trees in the last 31 days is recoverable from the `tank/tv` and `tank/movies`
+daily snapshots, which *are* replicated offsite. The recycle bin extends that
+window locally and cheaply. Copying 634 GB of already-deleted media across the
+WireGuard link, to duplicate coverage that is already there, would be cost
+without safety.
+
+Snapshotting it would also be actively unhelpful: it would pin every completed
+download and every soft delete, so the dataset could only ever grow.
+
+One observation rather than a defect: the three-year accumulation exists because
+neither sonarr nor radarr has a recycle-bin retention period set. That is
+reclaimable space whenever it is wanted.
 
 The media itself (`tank/tv`, `tank/movies`) is snapshotted daily with 31 days
 retained and replicated offsite — that is where the value is, and it is covered.
