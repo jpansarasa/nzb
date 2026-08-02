@@ -183,9 +183,22 @@ without safety.
 Snapshotting it would also be actively unhelpful: it would pin every completed
 download and every soft delete, so the dataset could only ever grow.
 
-One observation rather than a defect: the three-year accumulation exists because
-neither sonarr nor radarr has a recycle-bin retention period set. That is
-reclaimable space whenever it is wanted.
+The three-year accumulation was **not** a missing setting, which is worth being
+precise about because it looks like one. Both Sonarr and Radarr have Recycling
+Bin Cleanup set to 7 days. Their `CleanUpRecycleBin` task ran on schedule and
+failed on every single run:
+
+```
+Error occurred while executing task CleanUpRecycleBin
+System.UnauthorizedAccessException: Access to the path '/downloads/recycle/...'
+   at RecycleBinProvider.Cleanup()
+```
+
+That is the same `chown -R` defect described below, seen from the other end. The
+183 logged exceptions were not incidental noise about a stray file — they were
+the retention policy being unable to execute, for three years, behind a setting
+that was correct the whole time. Fixing the permissions fixed the cleanup, which
+is why roughly 620 GB became eligible for deletion the moment it was repaired.
 
 The media itself (`tank/tv`, `tank/movies`) is snapshotted daily with 31 days
 retained and replicated offsite — that is where the value is, and it is covered.
