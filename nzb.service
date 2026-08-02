@@ -1,0 +1,23 @@
+[Unit]
+Description=NZB Container Service
+Requires=docker.service
+After=docker.service
+ConditionPathExists=/opt/nzb/compose.yml
+ConditionPathIsDirectory=/tank/sabnzbd
+ConditionPathIsDirectory=/tank/sonarr
+ConditionPathIsDirectory=/tank/radarr
+ConditionPathIsDirectory=/tank/ombi
+
+[Service]
+Restart=always
+RestartSec=30
+Environment=OMBI_UID=2000 SONARR_UID=2001 RADARR_UID=2002 SABNZBD_UID=2003 MEDIA_GID=1500
+
+ExecStartPre=-/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb pull
+
+ExecStart=/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb up --remove-orphans
+
+ExecStop=/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb down --timeout 5
+
+[Install]
+WantedBy=multi-user.target

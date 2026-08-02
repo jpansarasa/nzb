@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail  # Exit on any error, unset variable, or failed pipe
+
+# Run from this script's own directory. `systemctl enable` below takes a path,
+# and $PWD would otherwise be wherever the caller happened to be standing.
+cd "$(dirname "$(readlink -f "$0")")"
+
+# The adduser calls are guarded because they are not re-runnable: these uids sit
+# above Debian's system range (LAST_SYSTEM_UID defaults to 999), so on a second
+# run `adduser --system` finds the existing user, decides it is not a system
+# user, and exits 13. The `zfs create -p` calls need no guard -- with -p they
+# already return 0 when the dataset exists.
+
+if ! getent passwd ombi >/dev/null; then
+    adduser --system --group --uid 2000 ombi
+fi
+zfs create -p tank/ombi
+chown -R ombi:ombi /tank/ombi
+
+if ! getent passwd sonarr >/dev/null; then
+    adduser --system --group --uid 2001 sonarr
+fi
+zfs create -p tank/sonarr
+chown -R sonarr:sonarr /tank/sonarr
+
+if ! getent passwd radarr >/dev/null; then
+    adduser --system --group --uid 2002 radarr
+fi
+zfs create -p tank/radarr
+chown -R radarr:radarr /tank/radarr
+
+if ! getent passwd sabnzbd >/dev/null; then
+    adduser --system --group --uid 2003 sabnzbd
+fi
+zfs create -p tank/sabnzbd
+chown -R sabnzbd:sabnzbd /tank/sabnzbd
+
+# Group creation and membership are separated: `groupadd --users` only applies
+# at creation time, so on a re-run it would exit 9 without ever reconciling
+# membership. `usermod --append` is a no-op for a user already in the group.
+if ! getent group media >/dev/null; then
+    groupadd --gid 1500 --system media
+fi
+usermod --append --groups media sonarr
+usermod --append --groups media radarr
+usermod --append --groups media sabnzbd
+
+zfs create -p tank/downloads
+#mkdir /tank/downloads/Movies
+#mkdir /tank/downloads/TV
+#chmod 775 -R /tank/downloads
+chown -R sabnzbd:media /tank/downloads
+
+systemctl enable "$PWD/nzb.service"
+
+# restart rather than start, so a re-run actually applies compose.yml changes.
+# Note this bounces the whole stack, including in-progress sabnzbd downloads.
+systemctl restart nzb.service

@@ -1,0 +1,191 @@
+name: nzb
+
+services:
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:latest
+    container_name: sabnzbd
+    hostname: sabnzbd
+    environment:
+      - PUID=2003
+      - PGID=1500
+      - TZ=America/New_York
+    volumes:
+      - sabnzbd:/config
+      - downloads:/downloads
+    ports:
+      - 6767:8080
+    healthcheck:
+      test: ["CMD", "curl", "-f", "--head", "http://0.0.0.0:8080/login/"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    restart: unless-stopped
+  sonarr:
+    image: lscr.io/linuxserver/sonarr:latest
+    container_name: sonarr
+    hostname: sonarr
+    environment:
+      - PUID=2001
+      - PGID=1500
+      - TZ=America/New_York
+    volumes:
+      - sonarr:/config
+      - downloads:/downloads
+      - tv:/tv
+    ports:
+      - 8989:8989
+    depends_on:
+      - sabnzbd
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://0.0.0.0:8989/ping"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    restart: unless-stopped
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    hostname: radarr
+    environment:
+      - PUID=2002
+      - PGID=1500
+      - TZ=America/New_York
+    volumes:
+      - radarr:/config
+      - downloads:/downloads
+      - movies:/movies
+    ports:
+      - 7878:7878
+    depends_on:
+      - sabnzbd
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://0.0.0.0:7878/ping"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    restart: unless-stopped
+  tdarr:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr
+    hostname: tdarr
+    environment:
+      - PUID=2001
+      - PGID=1500
+      - TZ=America/New_York
+      - UMASK_SET=002
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265 
+    volumes:
+      - tdarr_server:/app/server
+      - tdarr_configs:/app/configs
+      - tdarr_logs:/app/logs
+      - /var/tdarr:/temp
+      - tv:/media/tv
+      - movies:/media/movies
+    ports:
+      - 8265:8265
+      - 8266:8266
+    restart: unless-stopped
+  tdarr-node:
+    image: ghcr.io/haveagitgat/tdarr_node:latest
+    environment:
+      - PUID=2001
+      - PGID=1500
+      - TZ=America/New_York
+      - UMASK_SET=002
+      - serverIP=tdarr
+      - serverPort=8266
+    volumes:
+      - /var/tdarr:/temp
+      - tv:/media/tv
+      - movies:/media/movies
+    deploy:
+      replicas: 2  # Or however many workers you want
+    restart: unless-stopped
+    depends_on:
+      - tdarr
+  ombi:
+    image: lscr.io/linuxserver/ombi:latest
+    container_name: ombi
+    hostname: ombi
+    environment:
+      - PUID=2000
+      - PGID=2000
+      - TZ=America/New_York
+    volumes:
+      - ombi:/config
+    ports:
+      - 3579:3579
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://0.0.0.0:3579/"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+    restart: unless-stopped
+
+volumes:
+  sabnzbd:
+    driver: local
+    driver_opts:
+      device: /tank/sabnzbd
+      o: bind
+      type: none
+  sonarr:
+    driver: local
+    driver_opts:
+      device: /tank/sonarr
+      o: bind
+      type: none
+  radarr:
+    driver: local
+    driver_opts:
+      device: /tank/radarr
+      o: bind
+      type: none
+  tdarr_server:
+    driver: local
+    driver_opts:
+      device: /tank/tdarr/server
+      o: bind
+      type: none
+  tdarr_configs:
+    driver: local
+    driver_opts:
+      device: /tank/tdarr/configs
+      o: bind
+      type: none
+  tdarr_logs:
+    driver: local
+    driver_opts:
+      device: /tank/tdarr/logs
+      o: bind
+      type: none
+  ombi:
+    driver: local
+    driver_opts:
+      device: /tank/ombi
+      o: bind
+      type: none
+  downloads:
+    driver: local
+    driver_opts:
+      device: /tank/downloads
+      o: bind
+      type: none
+  tv:
+    driver: local
+    driver_opts:
+      device: /export/tv
+      o: bind
+      type: none
+  movies:
+    driver: local
+    driver_opts:
+      device: /export/movies
+      o: bind
+      type: none

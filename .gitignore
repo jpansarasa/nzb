@@ -1,0 +1,10 @@
+# Local cruft from in-place editing on the host.
+*.bak
+*.save
+*.log
+*.orig
+*.new
+
+# Compose reads this automatically from the project directory; it is where any
+# local override or credential would land. Never commit it.
+.env
