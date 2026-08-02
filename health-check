@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+#
+# Per-service liveness for the NZB stack.
+#
+# This exists because six services share one systemd unit. `docker compose up`
+# runs attached and does not exit while ANY service is still running, so a single
+# dead container leaves nzb.service at active/Result=success with NRestarts
+# unchanged -- measured: killing radarr changed nothing systemd could see.
+# Removing the compose `restart:` policy was necessary to stop dockerd
+# restarting containers behind systemd's back, but it does not make a single
+# service's death visible. This does.
+#
+# Anything found down is logged at priority err (so `journalctl -p err -u
+# nzb-health` and anything watching PRIORITY=3 sees it) and then recreated, which
+# is the per-service equivalent of the Restart=always the sibling repos rely on.
+# A service that keeps dying produces a repeated journal entry rather than a
+# silent gap, so a crash-loop stays visible.
+#
+# Run by nzb-health.timer; safe to run by hand.
+#
+set -euo pipefail
+
+COMPOSE=(/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb)
+SERVICES=(sabnzbd sonarr radarr tdarr ombi tdarr-node)
+
+# Only act when systemd believes the stack should be up; otherwise a deliberate
+# `systemctl stop nzb` would be fought by this timer.
+systemctl is-active --quiet nzb.service || { echo "nzb.service is not active; nothing to check."; exit 0; }
+
+# Do not race the stack's own startup. The unit goes active the moment
+# `docker compose up` is exec'd, long before six containers have started, and a
+# check firing in that window reports everything down and "recreates" services
+# that were already coming up -- observed doing exactly that during an install.
+# tdarr alone allows 2m in its healthcheck start period.
+SETTLE=240
+started=$(systemctl show nzb.service -p ActiveEnterTimestampMonotonic --value)
+now=$(awk '{printf "%d", $1 * 1000000}' /proc/uptime)
+if [ -n "$started" ] && [ "$started" -gt 0 ] 2>/dev/null; then
+    age=$(( (now - started) / 1000000 ))
+    if [ "$age" -lt "$SETTLE" ]; then
+        echo "nzb.service started ${age}s ago (< ${SETTLE}s); still settling, skipping."
+        exit 0
+    fi
+fi
+
+down=()
+for svc in "${SERVICES[@]}"; do
+    # `ps -q` lists only RUNNING containers for the service, so an exited or
+    # missing one yields nothing. tdarr-node is scaled to 2, hence the count.
+    want=1; [ "$svc" = tdarr-node ] && want=2
+    got=$("${COMPOSE[@]}" ps -q "$svc" 2>/dev/null | grep -c . || true)
+    [ "${got:-0}" -ge "$want" ] || down+=("$svc (running ${got:-0}/$want)")
+done
+
+if [ ${#down[@]} -eq 0 ]; then
+    echo "nzb: all services running."
+    exit 0
+fi
+
+for d in "${down[@]}"; do
+    echo "<3>nzb-health: service DOWN: $d -- recreating. nzb.service stays 'active' regardless, because six services share one unit." >&2
+done
+
+# Recreate only what is missing; --no-deps so fixing one does not bounce others.
+for entry in "${down[@]}"; do
+    svc=${entry%% *}
+    "${COMPOSE[@]}" up -d --no-deps "$svc" >/dev/null 2>&1 ||
+        echo "<3>nzb-health: failed to recreate $svc" >&2
+done
+echo "nzb-health: recreated ${#down[@]} service(s)."

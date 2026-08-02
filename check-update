@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# NZB stack image update check (fetch + flag, does NOT apply).
+#
+# Pulls the configured tag for each of the six images and compares it to what the
+# running containers are actually using. Anything that differs is "staged": it is
+# flagged (systemd journal + a marker file) but nothing is recreated.
+#
+# Apply deliberately, per service, so taking a Sonarr update does not also kill a
+# three-hour transcode or an 80%-complete download:
+#     sudo /opt/nzb/apply-update sonarr
+#
+# Run by nzb-update.timer; safe to run by hand.
+#
+set -euo pipefail
+
+COMPOSE=(/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb)
+MARKER=/run/nzb-update-available
+
+# Track whatever tags nzb.service would actually start. Parsed, never sourced.
+if [ -r /etc/nzb/images.env ]; then
+    for k in SABNZBD_TAG SONARR_TAG RADARR_TAG TDARR_TAG OMBI_TAG NZB_BIND_ADDR; do
+        v=$(grep -m1 -oP "^$k=\K.*" /etc/nzb/images.env 2>/dev/null || true)
+        v=${v%$'\r'}
+        [ -n "$v" ] && export "$k=$v"
+    done
+fi
+export SABNZBD_TAG="${SABNZBD_TAG:-latest}" SONARR_TAG="${SONARR_TAG:-latest}" \
+       RADARR_TAG="${RADARR_TAG:-latest}" TDARR_TAG="${TDARR_TAG:-latest}" \
+       OMBI_TAG="${OMBI_TAG:-latest}" NZB_BIND_ADDR="${NZB_BIND_ADDR:-127.0.0.1}"
+
+# One pull for the whole project. Aborts under set -e on a registry failure,
+# which is correct: comparing against stale local images would report "up to
+# date" when nothing was actually checked.
+"${COMPOSE[@]}" pull --quiet
+
+# Compare per service. A container that is not running yields "" and is skipped
+# rather than reported as an update, which would otherwise fire every time the
+# stack is down for maintenance.
+staged=()
+for svc in sabnzbd sonarr radarr tdarr ombi; do
+    cid=$("${COMPOSE[@]}" ps -q "$svc" 2>/dev/null | head -1 || true)
+    [ -n "$cid" ] || { echo "$svc: not running; skipping." >&2; continue; }
+    # Ask the CONTAINER which image reference it was created from, rather than
+    # grepping compose output -- "tdarr" matches both tdarr images, and a
+    # substring match across six services is exactly the kind of thing that
+    # silently reports on the wrong one.
+    running=$(docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true)
+    ref=$(docker inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+    if [ -z "$running" ] || [ -z "$ref" ]; then
+        echo "$svc: could not resolve its image; skipping." >&2
+        continue
+    fi
+    latest=$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true)
+    if [ -z "$latest" ]; then
+        echo "$svc: $ref not present locally after pull; skipping." >&2
+        continue
+    fi
+    [ "$running" = "$latest" ] || staged+=("$svc")
+done
+
+if [ ${#staged[@]} -gt 0 ]; then
+    {
+        echo "NZB stack updates staged (not applied)."
+        echo "services: ${staged[*]}"
+        echo "checked:  $(date -Is)"
+        echo
+        echo "Apply one at a time so unrelated work is not interrupted:"
+        for s in "${staged[@]}"; do echo "  sudo /opt/nzb/apply-update $s"; done
+        echo
+        echo "Sonarr and Radarr migrate their databases FORWARD on start and do"
+        echo "not migrate down. apply-update snapshots the dataset first."
+    } | tee "$MARKER" >&2
+    exit 0
+fi
+
+rm -f "$MARKER"
+echo "NZB stack: all five services already running their configured images."

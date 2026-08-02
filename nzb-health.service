@@ -1,0 +1,9 @@
+[Unit]
+Description=NZB stack per-service liveness check
+Documentation=file:/opt/nzb/health-check
+After=nzb.service
+ConditionPathExists=/opt/nzb/health-check
+
+[Service]
+Type=oneshot
+ExecStart=/opt/nzb/health-check

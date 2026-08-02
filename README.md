@@ -1,93 +1,226 @@
 # nzb
 
-The usenet/media-automation stack, run as Docker containers under a single
-systemd unit: **sabnzbd**, **sonarr**, **radarr**, **tdarr** (plus two
-transcode nodes), and **ombi**.
+The acquisition stack — sabnzbd, sonarr, radarr, tdarr (server + 2 nodes) and
+ombi — run as Docker containers under one systemd unit.
 
 ## Layout
 
 | File | Role |
 | --- | --- |
 | `install` | Idempotent installer. Run it for the first deploy and after every change. |
-| `compose.yml` | All six containers plus the bind-mounted volumes. |
-| `nzb.service` | Owns the stack. Pulls images on start (see below), then `up --remove-orphans`. |
+| `compose.yml` | The six service definitions and ten bind volumes. |
+| `nzb.service` | Owns the stack. Does **not** pull on start. |
+| `check-update` | Pulls the configured tags, compares to what is running, **stages** (never applies). |
+| `apply-update` | Applies a staged update to **one** service, snapshotting its dataset first. |
+| `nzb-update.{service,timer}` | Daily update check, off the boot critical path. |
+| `health-check` | Per-service liveness. Exists because six services share one unit. |
+| `nzb-health.{service,timer}` | Runs the above every 5 minutes. |
 
-## Users, uids, and the media group
+Paths are pinned: the unit hardcodes `/opt/nzb`, and `install` refuses to run
+from anywhere else.
 
-`install` creates one service user per app and the shared `media` group:
+## What is not in this repo
 
-| User | uid | Dataset |
-| --- | --- | --- |
-| `ombi` | 2000 | `tank/ombi` |
-| `sonarr` | 2001 | `tank/sonarr` |
-| `radarr` | 2002 | `tank/radarr` |
-| `sabnzbd` | 2003 | `tank/sabnzbd` |
-| — | gid 1500 | group `media` |
+`/tank/nzb/images.env` — the bind address and the five image pins. Not secret,
+but deployment-specific. `install` seeds it and refuses to converge until
+`NZB_BIND_ADDR` is filled in.
 
-`sonarr`, `radarr` and `sabnzbd` are added to `media`; `ombi` is not, and does
-not need to be — it mounts only its own `/config` and talks to the others over
-HTTP.
+It lives on the dataset so it travels with the pool, and `install` renders a
+**filtered** copy to `/etc/nzb/images.env`, which is the only one systemd reads.
+That split is not decoration: systemd opens `EnvironmentFile=` in **PID 1
+itself**, and `tank` is `failmode=wait`, so a file on the pool lets a faulted
+pool wedge PID 1. The filter matters too — `EnvironmentFile=` is applied *after*
+`Environment=`, so an unfiltered file could redefine anything in the unit.
 
-**Everything under `/export/{tv,movies,music}` must be group `media`.** That is
-how Plex reads the library — it owns none of those files. A download that lands
-outside the group is invisible to Plex with no error anywhere.
+The real credentials — the Usenet provider login in `/tank/sabnzbd/sabnzbd.ini`,
+and the API keys in `/tank/{sonarr,radarr}/config.xml` — belong to the apps and
+have never been in this repo. `.gitignore` is deliberately broad about
+credential-shaped names, and `install` additionally refuses to run if it finds
+one sitting in the repo directory, because no pattern list catches every name
+someone might use while debugging.
 
-## Storage
+## Updates are staged, not applied
 
-| Path | What | Replicated |
-| --- | --- | --- |
-| `/tank/{sonarr,radarr,sabnzbd,ombi}` | App config + databases | **yes** — monthly, 12 kept |
-| `/tank/downloads` | Download scratch, `sabnzbd:media` | no |
-| `/tank/tdarr` | tdarr server/config/logs | no |
-| `/var/tdarr` | tdarr transcode scratch | no — NVMe, ext4 |
-| `/export/{tv,movies}` | Library, written by sonarr/radarr | separate datasets |
+**This unit used to pull on start.** `ExecStartPre=-… docker compose … pull` ran
+on every start, which meant every `systemctl restart`, every `sudo ./install`,
+and every 30-second retry of a crash loop silently adopted whatever upstream had
+published — for six services at once. Sonarr and Radarr migrate their databases
+*forward* on startup and do not migrate down, so a routine restart was an
+unattended, irreversible upgrade of a library database with no rollback point.
 
-The four app-config datasets are opted into replication
-(`com.sun:auto-snapshot:monthly=true`); scratch and transcode space is not,
-deliberately. Replication is opt-in per dataset on this pool.
+Now `check-update` runs daily, compares each running container against the tag it
+would actually start, and writes `/run/nzb-update-available` listing only the
+services whose image moved. Nothing is recreated. Apply one at a time:
+
+```bash
+cat /run/nzb-update-available
+sudo /opt/nzb/apply-update sonarr
+```
+
+`apply-update` snapshots that service's dataset first and then recreates **only**
+that service with `--no-deps`, so taking a Sonarr update does not also kill a
+three-hour transcode or an eighty-percent-complete download. The snapshot is what
+makes a forward-only migration reversible.
+
+> If you edit `nzb.service` on an older host and the pull seems to come back:
+> there was an untracked drop-in at
+> `/etc/systemd/system/nzb.service.d/pull-not-on-boot.conf` that reset
+> `ExecStartPre=` and re-added a gated pull. `install` removes it. While it
+> existed, deleting the pull from the unit appeared to do nothing.
+
+### Pinning a bad release
+
+```bash
+sudo sed -i 's|^SONARR_TAG=.*|SONARR_TAG=4.0.15.2941|' /tank/nzb/images.env
+sudo /opt/nzb/install
+```
+
+Tags are per service, because six images from two registries move independently
+— except tdarr and tdarr-node, which share `TDARR_TAG` because they are released
+as a matched pair and must never be pinned apart.
+
+## Ports bind one address
+
+Every published port binds `NZB_BIND_ADDR`, and the compose fallback is
+loopback, which is fail-closed.
+
+This matters most for **tdarr, which has no authentication of any kind**.
+Measured on this host before the change: `GET /api/v2/get-nodes` returned live
+node configuration with no credential, and `/api/v2/cruddb` — a generic database
+read/write endpoint — answered 200, in a process holding `/export/tv` and
+`/export/movies` read-write. Sonarr, radarr and sabnzbd *do* enforce
+authentication (401, 401 and 403 respectively when probed without a key), so for
+them the scoping is defence in depth rather than a hole being closed.
+
+tdarr's port 8266 is no longer published at all. It is the node API, and
+tdarr-node reaches it as `tdarr` over the compose network, so publishing it
+exposed an unauthenticated endpoint for no benefit.
+
+Note Docker publishes ports by DNAT ahead of the INPUT chain, so a host firewall
+does not cover these without an explicit `DOCKER-USER` rule. Binding one address
+is the control that actually applies.
+
+## The media contract
+
+This repo owns the services that **write** `/export/tv` and `/export/movies`, so
+it owns the contract `/opt/plex` reads them through. Two mechanisms are in play
+and they are easy to conflate:
+
+**Within this stack, the `media` group (gid 1500) is load-bearing.** sabnzbd,
+sonarr, radarr and tdarr all run with `PGID=1500` and hand files to each other
+through it.
+
+**For Plex, the group does nothing.** Plex's supplementary groups come from its
+own image, so gid 1500 never reaches the process — `/opt/plex` measured this and
+corrected its README accordingly. What Plex reads through is the **world** bits.
+
+`UMASK_SET=002` is now set on every service that writes shared trees, not just
+tdarr. That single value satisfies both requirements: `0775`/`0664` is
+group-writable (this stack) *and* world-readable (Plex). Leaving it to the image
+default made a contract two repos depend on into an accident of which image
+happened to ship which default.
+
+### The download handoff tree
+
+`/tank/downloads` is `2775` with the setgid bit, and `install` repairs group
+ownership and group-write drift beneath it.
+
+It used to run `chown -R sabnzbd:media /tank/downloads` on every run. That was
+both expensive — 692 GB — and actively harmful: it rewrote the *owner* of files
+sonarr and radarr had created, without touching modes, so any directory lacking
+group-write became unwritable to everyone but sabnzbd. Sonarr logged 183
+`UnauthorizedAccessException` failures across 51 log files against its recycle
+bin as a direct result. What makes a shared tree work is the group plus setgid,
+so new directories inherit `media`, not a uniform owner.
+
+## One unit, six services
+
+They share a unit, and that is a real trade rather than an oversight. The cost is
+specific and was measured: `docker compose up` runs attached and does not exit
+while **any** service is still running, so killing radarr left `nzb.service` at
+`active`, `Result=success`, `NRestarts=0`. Removing the compose `restart:`
+policy was necessary — two supervisors made crash-loops invisible, as ntfy
+`fdd3118` documents — but it does **not** make one service's death visible.
+
+`health-check` closes that. Every five minutes it verifies each service is
+running (including both tdarr-node replicas), logs anything missing at priority
+`err`, and recreates it with `--no-deps`. That is the per-service equivalent of
+the `Restart=always` the sibling repos get for free, and a service that keeps
+dying produces a repeated journal entry rather than a silent gap.
+
+It refuses to act within four minutes of the unit going active, because the unit
+goes active the moment `compose up` is exec'd — long before six containers have
+started — and a check firing in that window "fixes" services that were already
+coming up. It was observed doing exactly that before the guard was added.
+
+```bash
+journalctl -p err -u nzb-health -n 20     # what is actually down
+```
+
+## Backups
+
+The six config datasets (`tank/{ombi,sonarr,radarr,sabnzbd,tdarr,nzb}`) carry
+`com.sun:auto-snapshot:monthly=true` and are replicated nightly. `install` now
+asserts that property **locally** on every run: they previously carried it with
+source `received`, inherited from the sending side, which meant a rebuilt host
+would have had no policy at all while `zfs get` still showed `true`.
+
+`tank/downloads` is deliberately **not** snapshotted. It is a 692 GB handoff area
+whose contents are transient by design; snapshots would pin every completed and
+deleted download, and the data is re-acquirable.
+
+The media itself (`tank/tv`, `tank/movies`) is snapshotted daily with 31 days
+retained and replicated offsite — that is where the value is, and it is covered.
+Worth knowing given these services hold it read-write: replication propagates
+deletions, so the 31 days of snapshots, not the offsite copy, are what protect
+against a misconfigured mass-delete.
 
 ## Recreating on a fresh machine
 
 Prerequisites: Docker with the compose plugin, ZFS with a pool named `tank`,
-systemd.
+systemd, `findmnt`, `curl`. The `media` group is created by this repo — `/opt/plex`
+depends on it, so install this one first.
 
 ```bash
 sudo git clone https://github.com/jpansarasa/nzb.git /opt/nzb
+sudo /opt/nzb/install          # seeds /tank/nzb/images.env, then stops
+sudo sed -i 's|^NZB_BIND_ADDR=.*|NZB_BIND_ADDR=10.0.0.5|' /tank/nzb/images.env
 sudo /opt/nzb/install
 ```
 
-`install` creates the four users, the `media` group, the datasets, registers
-the unit, and starts the stack. Restore `/tank/{sonarr,radarr,sabnzbd,ombi}`
-from backup to get the app databases, indexers, and API keys back; without
-them you get four freshly-configured apps.
+`install` creates the four service accounts, the `media` group, every dataset
+including `tank/tdarr` and its three subdirectories, `/var/tdarr`, and does not
+exit 0 until all five endpoints answer. It previously created five of the nine
+paths `compose.yml` binds, so this procedure did not actually work.
 
-## Day-to-day
+## Waiting, not skipping
+
+Every prerequisite that can be *late* is checked in a way that **fails and
+retries**, never one that skips. `Condition*` directives and a failed `Requires=`
+abort the start *job*: the unit never enters start, `Restart=` is never armed, it
+sits at `inactive (dead)` with `Result=success`, and nothing re-evaluates it.
+This unit used to gate on four `ConditionPathIsDirectory` lines, which a **bare
+mountpoint satisfies** — fail-open in exactly the case they appeared to guard —
+and which covered only four of the nine bind sources.
+
+The guards are now `ExecStartPre=`, covering the six config datasets, both media
+datasets, and the existence of the sonarr and radarr databases. An unmounted
+`tank/tv` is the one that matters most: sonarr and radarr would see the entire
+library as missing and begin re-acquiring it.
 
 ```bash
-# Apply a compose.yml or unit change (bounces the stack; see the warning below)
-sudo /opt/nzb/install
-
-# Just restart without re-running the installer
-sudo systemctl restart nzb.service
-
-docker compose --file /opt/nzb/compose.yml --project-name nzb ps
+systemctl is-active nzb            # "activating" while stuck
+journalctl -p err -u nzb -n 20     # the guards log why, every cycle
 ```
 
-`install` is idempotent and safe to run repeatedly, from any working
-directory.
+## Removing this service
 
-## Two things to know before running `install`
-
-**It restarts the stack.** That interrupts in-progress sabnzbd downloads and
-tdarr transcodes. Check the queue first if that matters.
-
-**It pulls `:latest` for all six images.** `nzb.service` has
-`ExecStartPre=-… pull`, so every start fetches the newest images and the
-restart then runs them. `sudo ./install` is therefore also an unattended
-upgrade of all six containers.
-
-## Notes
-
-- Healthchecks hit each app's own endpoint. `/ping` is unauthenticated on Sonarr and Radarr, so no API key is needed.
-- `tdarr-node` runs with `replicas: 2`, so those two containers are named `nzb-tdarr-node-1/2` rather than getting a fixed `container_name`.
-- Real API keys live in each app's own config under `/tank/<app>`, never here.
+```bash
+sudo systemctl disable --now nzb.service nzb-update.timer nzb-health.timer
+sudo docker compose --file /opt/nzb/compose.yml --project-name nzb down
+sudo rm -f /etc/systemd/system/nzb-update.service /etc/systemd/system/nzb-health.service
+sudo systemctl daemon-reload
+sudo rm -rf /opt/nzb /etc/nzb
+# The datasets hold the libraries, queue state and credentials. Deliberate step:
+# sudo zfs destroy -r tank/{sonarr,radarr,sabnzbd,ombi,tdarr,nzb}
+```

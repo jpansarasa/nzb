@@ -1,58 +1,282 @@
 #!/usr/bin/env bash
-set -euo pipefail  # Exit on any error, unset variable, or failed pipe
+#
+# Idempotent (re)install / redeploy for the NZB stack (sabnzbd, sonarr, radarr,
+# tdarr + 2 nodes, ombi).
+#
+# Safe to run repeatedly: every run converges and does not error on things that
+# already exist. The apps store their own configuration on the ZFS datasets
+# below, so nothing is deployed from this directory -- this repo is the
+# unit/lifecycle definition only.
+#
+# NOTE: the last step restarts the whole stack, interrupting in-progress
+# downloads and transcodes. Run it at a convenient time.
+#
+set -euo pipefail
 
 # Run from this script's own directory. `systemctl enable` below takes a path,
 # and $PWD would otherwise be wherever the caller happened to be standing.
 cd "$(dirname "$(readlink -f "$0")")"
 
-# The adduser calls are guarded because they are not re-runnable: these uids sit
-# above Debian's system range (LAST_SYSTEM_UID defaults to 999), so on a second
-# run `adduser --system` finds the existing user, decides it is not a system
-# user, and exits 13. The `zfs create -p` calls need no guard -- with -p they
-# already return 0 when the dataset exists.
+MEDIA_GID=1500
+DOWNLOADS=/tank/downloads
+TDARR_TEMP=/var/tdarr
+# Stack-level config, on the dataset so it travels with the pool. Rendered to
+# /etc because systemd opens EnvironmentFile= in PID 1 itself and tank is
+# failmode=wait -- a pin file on the pool could wedge PID 1 on a faulted pool.
+IMAGE_ENV_SRC=/tank/nzb/images.env
+IMAGE_ENV=/etc/nzb/images.env
 
-if ! getent passwd ombi >/dev/null; then
-    adduser --system --group --uid 2000 ombi
-fi
-zfs create -p tank/ombi
-chown -R ombi:ombi /tank/ombi
+# name:uid pairs. The uids are hardcoded in compose.yml as PUID/PGID.
+ACCOUNTS=(ombi:2000 sonarr:2001 radarr:2002 sabnzbd:2003)
+# Datasets holding app state, snapshotted monthly. downloads is deliberately
+# excluded -- see step 2.
+CONFIG_DATASETS=(ombi sonarr radarr sabnzbd tdarr nzb)
 
-if ! getent passwd sonarr >/dev/null; then
-    adduser --system --group --uid 2001 sonarr
-fi
-zfs create -p tank/sonarr
-chown -R sonarr:sonarr /tank/sonarr
+die() { echo "install: $*" >&2; exit 1; }
 
-if ! getent passwd radarr >/dev/null; then
-    adduser --system --group --uid 2002 radarr
-fi
-zfs create -p tank/radarr
-chown -R radarr:radarr /tank/radarr
+# 0. Preconditions. None of these existed before, and the path assertion is not
+#    cosmetic: nzb.service hardcodes /opt/nzb, so a clone elsewhere would enable
+#    a unit pointing at a tree that is not the one you just edited.
+[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo ./install)"
+[ "$PWD" = /opt/nzb ] || die "must be installed at /opt/nzb (found $PWD); nzb.service hardcodes that path"
 
-if ! getent passwd sabnzbd >/dev/null; then
-    adduser --system --group --uid 2003 sabnzbd
-fi
-zfs create -p tank/sabnzbd
-chown -R sabnzbd:sabnzbd /tank/sabnzbd
+for cmd in docker zfs zpool systemctl adduser usermod groupadd findmnt curl; do
+    command -v "$cmd" >/dev/null || die "missing required command: $cmd"
+done
+docker compose version >/dev/null 2>&1 || die "the docker compose plugin is not available"
+zpool list -H -o name tank >/dev/null 2>&1 || die "zpool 'tank' not found"
 
-# Group creation and membership are separated: `groupadd --users` only applies
-# at creation time, so on a re-run it would exit 9 without ever reconciling
-# membership. `usermod --append` is a no-op for a user already in the group.
+# A credential-shaped file in this directory is always a mistake. These apps keep
+# API keys and Usenet provider logins in their config files, and copying one here
+# to inspect it during debugging is the realistic way one gets published.
+for f in ./*.env ./config.xml ./sabnzbd.ini; do
+    [ -e "$f" ] && die "found $f in the repo directory -- this repo is public. Move it out before running install."
+done
+
+# 1. Service accounts. The getent guards are load-bearing rather than idempotency
+#    sugar: these uids sit above Debian's system range, so on a second run
+#    `adduser --system` finds the user, decides it is not a system user, and
+#    exits 13, taking this script with it.
+for entry in "${ACCOUNTS[@]}"; do
+    name=${entry%%:*}; uid=${entry##*:}
+    if ! getent passwd "$name" >/dev/null; then
+        adduser --system --group --uid "$uid" "$name"
+    fi
+    # Existence is not enough: compose.yml hardcodes these uids as PUID, and the
+    # datasets are chowned to whatever the account actually is. An account at a
+    # different uid means the container cannot read its own config, which fails
+    # at runtime rather than here.
+    if [ "$(id -u "$name")" != "$uid" ]; then
+        die "user $name is uid=$(id -u "$name"), expected $uid (see compose.yml PUID)"
+    fi
+done
+
+# Group creation and membership are separated: `groupadd --users` only applies at
+# creation, so on a re-run it would exit 9 without reconciling membership.
 if ! getent group media >/dev/null; then
-    groupadd --gid 1500 --system media
+    groupadd --gid "$MEDIA_GID" --system media
 fi
-usermod --append --groups media sonarr
-usermod --append --groups media radarr
-usermod --append --groups media sabnzbd
+[ "$(getent group media | cut -d: -f3)" = "$MEDIA_GID" ] ||
+    die "group media is gid $(getent group media | cut -d: -f3), expected $MEDIA_GID (compose.yml sets PGID=$MEDIA_GID)"
+for u in sonarr radarr sabnzbd; do
+    usermod --append --groups media "$u"      # no-op if already a member
+done
 
-zfs create -p tank/downloads
-#mkdir /tank/downloads/Movies
-#mkdir /tank/downloads/TV
-#chmod 775 -R /tank/downloads
-chown -R sabnzbd:media /tank/downloads
+# 2. Datasets.
+#
+#    Snapshot policy is set ONLY on creation, deliberately: on a restore the
+#    property arrives with the received dataset, and a dataset opted out on
+#    purpose must not be silently opted back in. monthly/keep=12 matches this
+#    pool's convention for regenerable service config -- these hold library
+#    databases and app settings, which are rebuildable from the media plus some
+#    re-configuration, unlike /tank/plex's watch history.
+#
+#    NOTE this does not retrofit existing datasets. On this host the four
+#    original ones already carry monthly=true with source `received`, which is
+#    inherited from the sending side and would NOT survive a rebuild from this
+#    repo -- so the property is asserted below for those too.
+for d in "${CONFIG_DATASETS[@]}"; do
+    if ! zfs list -H -o name "tank/$d" >/dev/null 2>&1; then
+        zfs create -p "tank/$d"
+        if command -v zfs-auto-snapshot >/dev/null; then
+            zfs-auto-snapshot --label=monthly --keep=12 "tank/$d" >/dev/null 2>&1 || true
+        fi
+    fi
+    # Asserted every run, not just on creation: `received` is not `local`, and a
+    # rebuilt host would otherwise have no policy at all while looking correct.
+    if [ "$(zfs get -H -o source com.sun:auto-snapshot:monthly "tank/$d")" != local ]; then
+        zfs set com.sun:auto-snapshot:monthly=true "tank/$d"
+        echo "install: set local monthly snapshot policy on tank/$d" >&2
+    fi
+done
 
+#    downloads is deliberately NOT snapshotted. It is a 692 GB handoff area whose
+#    contents are transient by design; snapshots would pin every deleted download
+#    and the data is re-acquirable. It is created without a policy on purpose.
+zfs list -H -o name tank/downloads >/dev/null 2>&1 || zfs create -p tank/downloads
+
+#    Existing is not the same as mounted, and `zfs create -p`/`zfs list` succeed
+#    for either. Everything below would otherwise write into bare mountpoints on
+#    the tank root dataset, and the stack would start on empty state.
+for d in "${CONFIG_DATASETS[@]}" downloads; do
+    [ "$(findmnt -no SOURCE "/tank/$d" 2>/dev/null)" = "tank/$d" ] ||
+        die "/tank/$d is not a mount of tank/$d -- refusing to converge (try: zfs mount tank/$d)"
+done
+for d in tv movies; do
+    [ "$(findmnt -no SOURCE "/export/$d" 2>/dev/null)" = "tank/$d" ] ||
+        die "/export/$d is not a mount of tank/$d -- refusing to converge; sonarr and radarr would treat the library as missing"
+done
+
+# 3. Per-app config ownership. Only the dataset root, not a recursive sweep: the
+#    apps own their own trees and the containers chown on start.
+chown ombi:ombi    /tank/ombi
+chown sonarr:media /tank/sonarr
+chown radarr:media /tank/radarr
+chown sabnzbd:media /tank/sabnzbd
+chown sonarr:media /tank/tdarr
+mkdir -p /tank/tdarr/server /tank/tdarr/configs /tank/tdarr/logs
+chown sonarr:media /tank/tdarr/server /tank/tdarr/configs /tank/tdarr/logs
+
+#    tdarr's transcode scratch, deliberately on the NVMe rather than the pool.
+#    Nothing used to create it, so on a fresh machine docker made it root:root
+#    and tdarr (2001) could not write there.
+mkdir -p "$TDARR_TEMP"
+chown sonarr:media "$TDARR_TEMP"
+
+# 4. The shared handoff tree. This replaces `chown -R sabnzbd:media /tank/downloads`,
+#    which was both expensive (692 GB, every run) and actively harmful: it rewrote
+#    the OWNER of files sonarr and radarr had created, and because it changed
+#    ownership without touching modes, directories left without group-write became
+#    unwritable to everyone but sabnzbd. Sonarr has logged 183
+#    UnauthorizedAccessException failures across 51 log files against its recycle
+#    bin under this tree as a direct result.
+#
+#    What actually makes a shared tree work is the group plus the setgid bit, not
+#    a uniform owner: setgid makes new subdirectories inherit `media`, and
+#    UMASK_SET=002 (now set on sabnzbd, sonarr and radarr in compose.yml, not just
+#    tdarr) makes new files group-writable and world-readable. World-readable
+#    matters because /opt/plex reads the library through the world bits.
+#
+#    The finds below only touch entries that are already wrong, so after the first
+#    run they are a cheap metadata walk. `|| true` because an advisory repair must
+#    never abort a deploy -- these trees are written continuously, so a path
+#    vanishing mid-walk is routine and makes find exit 1 under pipefail.
+chown sabnzbd:media "$DOWNLOADS"
+chmod 2775 "$DOWNLOADS"
+find "$DOWNLOADS" ! -group media -exec chgrp media {} + 2>/dev/null || true
+find "$DOWNLOADS" -type d ! -perm -2775 -exec chmod 2775 {} + 2>/dev/null || true
+find "$DOWNLOADS" -type f ! -perm -g+w -exec chmod g+w {} + 2>/dev/null || true
+
+# 5. Render the systemd-visible tag pins. Always written so the unit finds a
+#    file; an absent source means every tag is latest. Only the five known keys
+#    plus the bind address cross over: EnvironmentFile= is applied AFTER
+#    Environment=, so an unfiltered file could redefine anything in the unit.
+mkdir -p /etc/nzb "$(dirname "$IMAGE_ENV_SRC")"
+if [ ! -e "$IMAGE_ENV_SRC" ]; then
+    cat > "$IMAGE_ENV_SRC" <<'EOF'
+# Stack-level deployment settings for /opt/nzb. Not secret, but
+# deployment-specific, so this is here and not in git. Edit and re-run
+# /opt/nzb/install; the units read a filtered render at /etc/nzb/images.env.
+
+# The single address every published port binds to. Compose falls back to
+# 127.0.0.1 if this is empty, which is fail-closed. tdarr in particular has NO
+# authentication, so this must not be 0.0.0.0.
+NZB_BIND_ADDR=
+
+# Image pins. Leave as latest unless a release needs holding back. Sonarr and
+# Radarr migrate their databases forward and do not migrate down, so pinning is
+# the only way to decline one.
+SABNZBD_TAG=latest
+SONARR_TAG=latest
+RADARR_TAG=latest
+TDARR_TAG=latest
+OMBI_TAG=latest
+EOF
+    echo "install: wrote template $IMAGE_ENV_SRC" >&2
+fi
+
+read_var() {
+    local v
+    v=$(grep -m1 -oP "^$2=\K.*" "$1" 2>/dev/null || true)
+    v=${v%$'\r'}; v=${v#\"}; v=${v%\"}
+    printf '%s' "$v"
+}
+BIND=$(read_var "$IMAGE_ENV_SRC" NZB_BIND_ADDR)
+[ -n "$BIND" ] || die "NZB_BIND_ADDR is unset in $IMAGE_ENV_SRC.
+  Set it to the one address these admin UIs should listen on, then re-run.
+  It cannot be guessed, and it must not be 0.0.0.0: tdarr has no authentication."
+
+{
+    echo "# GENERATED by /opt/nzb/install -- do not edit."
+    echo "# Source of truth is $IMAGE_ENV_SRC, on the dataset."
+    echo "NZB_BIND_ADDR=$BIND"
+    for k in SABNZBD_TAG SONARR_TAG RADARR_TAG TDARR_TAG OMBI_TAG; do
+        v=$(read_var "$IMAGE_ENV_SRC" "$k")
+        echo "$k=${v:-latest}"
+        [ -n "$v" ] && [ "$v" != latest ] && echo "install: $k PINNED to $v" >&2
+    done
+} > "$IMAGE_ENV"
+chown root:root "$IMAGE_ENV" "$IMAGE_ENV_SRC"
+chmod 0644 "$IMAGE_ENV" "$IMAGE_ENV_SRC"
+
+# 6. Retire the pull-not-on-boot drop-in. It reset ExecStartPre= and re-added a
+#    boot-gated `compose pull`, which was a reasonable patch while the unit still
+#    pulled on start. The unit no longer does, so the drop-in is not merely
+#    redundant -- it would RE-ADD the pull and silently undo the fix. All three
+#    sibling repos remove their equivalent for the same reason.
+rm -f /etc/systemd/system/nzb.service.d/pull-not-on-boot.conf
+rmdir --ignore-fail-on-non-empty /etc/systemd/system/nzb.service.d 2>/dev/null || true
+
+# 7. Register units (idempotent). The oneshot update service has no [Install]
+#    section, so it is `link`ed rather than enabled, so the timer resolves it.
 systemctl enable "$PWD/nzb.service"
+if ! systemctl cat nzb-update.service >/dev/null 2>&1; then
+    systemctl link "$PWD/nzb-update.service"
+fi
+systemctl enable "$PWD/nzb-update.timer"
+# Per-service liveness. Needed because six services share one unit, so a single
+# dead container leaves nzb.service at active/success -- measured, not assumed.
+if ! systemctl cat nzb-health.service >/dev/null 2>&1; then
+    systemctl link "$PWD/nzb-health.service"
+fi
+systemctl enable "$PWD/nzb-health.timer"
+systemctl daemon-reload
 
-# restart rather than start, so a re-run actually applies compose.yml changes.
-# Note this bounces the whole stack, including in-progress sabnzbd downloads.
-systemctl restart nzb.service
+# 8. Apply. Reported rather than left to `set -e`: an ExecStartPre failure puts
+#    the unit in a 30s retry loop, so a non-zero restart means "not up yet", not
+#    "dead" -- and dying here would skip the timer start below.
+systemctl restart nzb.service ||
+    echo "install: WARNING -- nzb.service did not start cleanly; it retries every 30s. Reason: journalctl -p err -u nzb -n 20" >&2
+systemctl start nzb-update.timer nzb-health.timer
+
+# 9. Smoke test. nzb.service is Type=simple, so `systemctl restart` returns the
+#    instant `docker compose up` is exec'd -- before an image is resolved or a
+#    volume mounted. "converged" used to mean nothing more than a successful
+#    fork, and with six services behind one unit a single sick app is easy to
+#    miss. Each endpoint is checked separately so the failure names the service.
+declare -A PROBE=(
+  [sabnzbd]="http://${BIND}:6767/"
+  [sonarr]="http://${BIND}:8989/ping"
+  [radarr]="http://${BIND}:7878/ping"
+  [tdarr]="http://${BIND}:8265/"
+  [ombi]="http://${BIND}:3579/"
+)
+failed=()
+for svc in "${!PROBE[@]}"; do
+    ok=
+    for _ in $(seq 45); do
+        if curl -fsS --max-time 2 -o /dev/null "${PROBE[$svc]}" 2>/dev/null; then ok=1; break; fi
+        sleep 2
+    done
+    [ -n "$ok" ] || failed+=("$svc (${PROBE[$svc]})")
+done
+
+if [ ${#failed[@]} -gt 0 ]; then
+    die "the stack started but these services never answered within 90s:
+$(printf '    %s\n' "${failed[@]}")
+  Check the ones named:
+    docker compose --file /opt/nzb/compose.yml --project-name nzb ps
+    docker logs --tail 30 <service>"
+fi
+
+echo "install: nzb converged -- all five endpoints answering on $BIND"

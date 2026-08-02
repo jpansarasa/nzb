@@ -1,74 +1,108 @@
 name: nzb
 
+# Six services, one unit. Images come from the environment so a bad release can
+# be pinned out without editing this (tracked, public) file; nzb.service sets
+# every *_TAG to latest and lets /etc/nzb/images.env override it.
+#
+# Ports bind ONE address, not every interface. NZB_BIND_ADDR comes from
+# /etc/nzb/images.env (rendered by install from the dataset) and the fallback is
+# fail-closed loopback. This matters most for tdarr, which has no authentication
+# of any kind: verified on this host, GET /api/v2/get-nodes returned live node
+# data with no credential, and /api/v2/cruddb answered 200 -- a generic database
+# read/write endpoint, in a process holding /export/tv and /export/movies
+# read-write. sonarr, radarr and sabnzbd do enforce auth (401/401/403 measured),
+# so for them this is defence in depth rather than a hole being closed.
+#
+# UMASK_SET=002 on every service that writes shared trees, not just tdarr. 002
+# yields 0775 dirs and 0664 files: group-write, which is what lets sabnzbd,
+# sonarr and radarr hand files to each other through the `media` group, AND
+# world-read, which is what /opt/plex actually reads the library through. Both
+# requirements are satisfied by the same value, and leaving it to the image
+# default made a contract two repos depend on into an accident.
+
 services:
   sabnzbd:
-    image: lscr.io/linuxserver/sabnzbd:latest
+    image: lscr.io/linuxserver/sabnzbd:${SABNZBD_TAG:-latest}
     container_name: sabnzbd
     hostname: sabnzbd
     environment:
       - PUID=2003
       - PGID=1500
       - TZ=America/New_York
+      - UMASK_SET=002
     volumes:
       - sabnzbd:/config
       - downloads:/downloads
     ports:
-      - 6767:8080
+      - "${NZB_BIND_ADDR:-127.0.0.1}:6767:8080"
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 2g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
     healthcheck:
-      test: ["CMD", "curl", "-f", "--head", "http://0.0.0.0:8080/login/"]
+      test: ["CMD", "curl", "-f", "--head", "http://127.0.0.1:8080/login/"]
       interval: 1m
       timeout: 10s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+
   sonarr:
-    image: lscr.io/linuxserver/sonarr:latest
+    image: lscr.io/linuxserver/sonarr:${SONARR_TAG:-latest}
     container_name: sonarr
     hostname: sonarr
     environment:
       - PUID=2001
       - PGID=1500
       - TZ=America/New_York
+      - UMASK_SET=002
     volumes:
       - sonarr:/config
       - downloads:/downloads
       - tv:/tv
     ports:
-      - 8989:8989
+      - "${NZB_BIND_ADDR:-127.0.0.1}:8989:8989"
     depends_on:
       - sabnzbd
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 2g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://0.0.0.0:8989/ping"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8989/ping"]
       interval: 1m
       timeout: 10s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+
   radarr:
-    image: lscr.io/linuxserver/radarr:latest
+    image: lscr.io/linuxserver/radarr:${RADARR_TAG:-latest}
     container_name: radarr
     hostname: radarr
     environment:
       - PUID=2002
       - PGID=1500
       - TZ=America/New_York
+      - UMASK_SET=002
     volumes:
       - radarr:/config
       - downloads:/downloads
       - movies:/movies
     ports:
-      - 7878:7878
+      - "${NZB_BIND_ADDR:-127.0.0.1}:7878:7878"
     depends_on:
       - sabnzbd
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 2g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://0.0.0.0:7878/ping"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:7878/ping"]
       interval: 1m
       timeout: 10s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+
   tdarr:
-    image: ghcr.io/haveagitgat/tdarr:latest
+    # Both tdarr images share one tag on purpose: server and node are released as
+    # a matched pair and a version skew between them is a support nightmare.
+    image: ghcr.io/haveagitgat/tdarr:${TDARR_TAG:-latest}
     container_name: tdarr
     hostname: tdarr
     environment:
@@ -78,7 +112,7 @@ services:
       - UMASK_SET=002
       - serverIP=0.0.0.0
       - serverPort=8266
-      - webUIPort=8265 
+      - webUIPort=8265
     volumes:
       - tdarr_server:/app/server
       - tdarr_configs:/app/configs
@@ -87,11 +121,23 @@ services:
       - tv:/media/tv
       - movies:/media/movies
     ports:
-      - 8265:8265
-      - 8266:8266
-    restart: unless-stopped
+      # 8265 is the web UI. It is scoped hard because tdarr has no auth at all.
+      # 8266 is deliberately NOT published: it is the node API, and tdarr-node
+      # reaches it as `tdarr` over the compose network. Publishing it exposed an
+      # unauthenticated CRUD endpoint to the network for no benefit.
+      - "${NZB_BIND_ADDR:-127.0.0.1}:8265:8265"
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 4g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8265/ || exit 1"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 2m
+
   tdarr-node:
-    image: ghcr.io/haveagitgat/tdarr_node:latest
+    image: ghcr.io/haveagitgat/tdarr_node:${TDARR_TAG:-latest}
     environment:
       - PUID=2001
       - PGID=1500
@@ -104,88 +150,73 @@ services:
       - tv:/media/tv
       - movies:/media/movies
     deploy:
-      replicas: 2  # Or however many workers you want
-    restart: unless-stopped
+      replicas: 2
+    # Transcoding is the one workload here that legitimately wants headroom, so
+    # this ceiling is generous. It exists to stop a runaway node competing with
+    # ntfy, which is this host's alert channel, not to ration normal work.
+    mem_limit: 6g
+    security_opt: [ "no-new-privileges:true" ]
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
     depends_on:
       - tdarr
+
   ombi:
-    image: lscr.io/linuxserver/ombi:latest
+    image: lscr.io/linuxserver/ombi:${OMBI_TAG:-latest}
     container_name: ombi
     hostname: ombi
     environment:
       - PUID=2000
       - PGID=2000
       - TZ=America/New_York
+      - UMASK_SET=022
     volumes:
       - ombi:/config
     ports:
-      - 3579:3579
+      - "${NZB_BIND_ADDR:-127.0.0.1}:3579:3579"
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 1g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://0.0.0.0:3579/"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3579/"]
       interval: 1m
       timeout: 10s
       retries: 3
       start_period: 1m
-    restart: unless-stopped
+
+# NOTE: no `restart:` policy on any service, deliberately. systemd is the only
+# supervisor. With one, dockerd restarts containers behind the unit's back -- the
+# attached `compose up` never exits, so a crash-loop leaves the unit green and
+# Restart=always dead code. Observed on this host with ntfy (fdd3118): nine
+# container restarts while systemd logged no state change at all.
 
 volumes:
   sabnzbd:
     driver: local
-    driver_opts:
-      device: /tank/sabnzbd
-      o: bind
-      type: none
+    driver_opts: { device: /tank/sabnzbd, o: bind, type: none }
   sonarr:
     driver: local
-    driver_opts:
-      device: /tank/sonarr
-      o: bind
-      type: none
+    driver_opts: { device: /tank/sonarr, o: bind, type: none }
   radarr:
     driver: local
-    driver_opts:
-      device: /tank/radarr
-      o: bind
-      type: none
+    driver_opts: { device: /tank/radarr, o: bind, type: none }
   tdarr_server:
     driver: local
-    driver_opts:
-      device: /tank/tdarr/server
-      o: bind
-      type: none
+    driver_opts: { device: /tank/tdarr/server, o: bind, type: none }
   tdarr_configs:
     driver: local
-    driver_opts:
-      device: /tank/tdarr/configs
-      o: bind
-      type: none
+    driver_opts: { device: /tank/tdarr/configs, o: bind, type: none }
   tdarr_logs:
     driver: local
-    driver_opts:
-      device: /tank/tdarr/logs
-      o: bind
-      type: none
+    driver_opts: { device: /tank/tdarr/logs, o: bind, type: none }
   ombi:
     driver: local
-    driver_opts:
-      device: /tank/ombi
-      o: bind
-      type: none
+    driver_opts: { device: /tank/ombi, o: bind, type: none }
   downloads:
     driver: local
-    driver_opts:
-      device: /tank/downloads
-      o: bind
-      type: none
+    driver_opts: { device: /tank/downloads, o: bind, type: none }
   tv:
     driver: local
-    driver_opts:
-      device: /export/tv
-      o: bind
-      type: none
+    driver_opts: { device: /export/tv, o: bind, type: none }
   movies:
     driver: local
-    driver_opts:
-      device: /export/movies
-      o: bind
-      type: none
+    driver_opts: { device: /export/movies, o: bind, type: none }

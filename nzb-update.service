@@ -1,0 +1,20 @@
+[Unit]
+Description=NZB stack image update check (fetch configured tags, flag if newer than running)
+Documentation=file:/opt/nzb/check-update
+
+# Requires= here, deliberately, even though the same directive is a defect in
+# nzb.service. The wedge there exists because nothing re-enqueues a start job
+# after a dependency-aborted start; a timer enqueues a brand-new one at every
+# elapse, so the worst case is one skipped daily check.
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/nzb/check-update
+
+[Service]
+Type=oneshot
+# Must agree with nzb.service, or the checker reports on images a restart would
+# not actually run.
+Environment=SABNZBD_TAG=latest SONARR_TAG=latest RADARR_TAG=latest TDARR_TAG=latest OMBI_TAG=latest
+EnvironmentFile=-/etc/nzb/images.env
+ExecStart=/opt/nzb/check-update

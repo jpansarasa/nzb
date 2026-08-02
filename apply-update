@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#
+# Apply a staged image update to ONE service, with a rollback point.
+#
+# Recreates just that service, so updating sonarr does not interrupt an
+# in-progress download or a running transcode. Takes a ZFS snapshot of the
+# service's dataset first, because Sonarr and Radarr migrate their databases
+# forward on start and do not migrate down -- the snapshot is the only way back.
+#
+#     sudo /opt/nzb/apply-update sonarr
+#
+set -euo pipefail
+
+svc=${1:-}
+case "$svc" in
+    sabnzbd|sonarr|radarr|ombi) ds="tank/$svc" ;;
+    tdarr)                      ds=tank/tdarr ;;
+    *) echo "usage: $0 {sabnzbd|sonarr|radarr|tdarr|ombi}" >&2; exit 2 ;;
+esac
+[ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+
+snap="$ds@pre-update-$(date +%F-%H%M)"
+zfs snapshot "$snap"
+echo "apply-update: rollback point $snap"
+
+COMPOSE=(/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb)
+# --no-deps so recreating sonarr does not also recreate sabnzbd underneath it.
+"${COMPOSE[@]}" up -d --no-deps "$svc"
+
+echo "apply-update: $svc recreated. If it goes wrong:"
+echo "    systemctl stop nzb.service && zfs rollback $snap && systemctl start nzb.service"

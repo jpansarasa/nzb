@@ -5,6 +5,16 @@
 *.orig
 *.new
 
-# Compose reads this automatically from the project directory; it is where any
-# local override or credential would land. Never commit it.
+# Credential and deployment-parameter files. NOTHING of this shape is ever
+# tracked. The rule is broad on purpose: these apps keep Usenet provider logins
+# and indexer API keys in their own config files, and the realistic way one gets
+# published is copying it here to look at during debugging. Compose also reads
+# .env automatically from the project directory.
+*.env
 .env
+config.xml
+sabnzbd.ini
+secrets.env
+
+# `install` additionally refuses to run if it finds a credential-shaped file in
+# this directory, because no pattern list catches every name someone might use.

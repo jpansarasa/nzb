@@ -1,23 +1,88 @@
 [Unit]
-Description=NZB Container Service
-Requires=docker.service
+Description=NZB container stack (sabnzbd, sonarr, radarr, tdarr, ombi)
+
+# Wants=, NOT Requires=. A failed Requires= dependency aborts the START JOB: the
+# unit never enters start, Restart= is never armed, and it sits at inactive/dead
+# with Result=success -- absent from `systemctl --failed`, and never revived when
+# docker is repaired, because nothing re-enqueues a start job. docker.service is
+# StartLimitBurst=3/StartLimitIntervalSec=60, so a boot where containerd races
+# dockerd makes docker give up in ~4s and this unit follows it into a silent
+# grave. With Wants=, a dead dockerd fails ExecStart instead, which DOES arm
+# Restart=always. Same lesson as ntfy e3588fa.
+Wants=docker.service
 After=docker.service
+After=zfs-mount.service
+
+# A Condition is right for this one: /opt is on the root filesystem, so it cannot
+# arrive late, and its absence means the install is gone -- a human action, not a
+# transient fault. It is the WRONG semantic for the datasets, which is why the
+# four ConditionPathIsDirectory lines that used to gate /tank/{sabnzbd,sonarr,
+# radarr,ombi} are gone: a BARE MOUNTPOINT satisfies a directory test, so they
+# passed in exactly the fail-open case they appeared to guard, and they covered
+# only four of the nine bind sources anyway.
 ConditionPathExists=/opt/nzb/compose.yml
-ConditionPathIsDirectory=/tank/sabnzbd
-ConditionPathIsDirectory=/tank/sonarr
-ConditionPathIsDirectory=/tank/radarr
-ConditionPathIsDirectory=/tank/ombi
+
+StartLimitIntervalSec=0
 
 [Service]
 Restart=always
 RestartSec=30
-Environment=OMBI_UID=2000 SONARR_UID=2001 RADARR_UID=2002 SABNZBD_UID=2003 MEDIA_GID=1500
 
-ExecStartPre=-/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb pull
+# Image tags. latest is the normal state; pin a bad release by writing the tag
+# into /tank/nzb/images.env and re-running install, which renders the value here.
+# Per service, because six images from two registries move independently -- but
+# tdarr and tdarr-node share TDARR_TAG, since they are released as a matched pair
+# and must never be pinned apart.
+#
+# The render is what systemd reads: EnvironmentFile= is opened by PID 1 ITSELF
+# (measured on this host), and tank is failmode=wait, so pointing it at the pool
+# would let a faulted pool wedge PID 1. install filters the render to the known
+# keys, so nothing else in the source file can reach this unit's environment.
+Environment=SABNZBD_TAG=latest SONARR_TAG=latest RADARR_TAG=latest TDARR_TAG=latest OMBI_TAG=latest
+EnvironmentFile=-/etc/nzb/images.env
 
+# There is deliberately NO `docker compose pull` here. It used to be an
+# ExecStartPre, which meant every restart -- including every `sudo ./install`,
+# and every 30-second retry of a crash loop -- silently adopted whatever upstream
+# had published for six services at once. Sonarr and Radarr migrate their
+# databases forward on startup and do not migrate down, so that made a routine
+# restart an unattended, irreversible upgrade. Updates are now staged by
+# nzb-update.timer and applied deliberately. `compose up` still pulls an image
+# that is genuinely missing, so a fresh host works.
+#
+# NOTE: the drop-in that used to paper over this (pull-not-on-boot.conf) is
+# removed by install. It reset ExecStartPre= and re-added a gated pull, so while
+# it existed, deleting the pull from this file appeared to do nothing.
+
+# The config datasets. `zfs list` succeeds for an unmounted dataset and the
+# mountpoints survive an unmount, so without this the compose binds would attach
+# to empty directories on the tank root dataset: sabnzbd would re-download into
+# nowhere, and sonarr/radarr would come up with an EMPTY library database and
+# start treating a full library as missing. -C keeps findmnt from canonicalizing
+# (it would readlink() /tank, and tank is failmode=wait).
+ExecStartPre=/bin/sh -c 'for d in sabnzbd sonarr radarr ombi downloads tdarr; do /usr/bin/findmnt -C --type zfs --source "tank/$d" --mountpoint "/tank/$d" --noheadings >/dev/null || { echo "<3>nzb: tank/$d is NOT mounted at /tank/$d -- refusing to start, because the stack would bind an empty directory and the apps would treat their state as missing. Retrying every 30s."; exit 1; }; done'
+
+# The media datasets, bound READ-WRITE into sonarr, radarr and both tdarr nodes.
+# Unmounted, these bind to empty directories on the root filesystem: sonarr and
+# radarr would see every episode and film as missing and begin re-acquiring the
+# entire library, and the writes would land on a root filesystem far too small
+# to hold them.
+ExecStartPre=/bin/sh -c 'for d in tv movies; do /usr/bin/findmnt -C --type zfs --source "tank/$d" --mountpoint "/export/$d" --noheadings >/dev/null || { echo "<3>nzb: tank/$d is NOT mounted at /export/$d -- refusing to start, because sonarr/radarr would see the library as missing and start re-acquiring it. Retrying every 30s."; exit 1; }; done'
+
+# Mounted but empty is the same hazard for the two apps that hold a library.
+ExecStartPre=/usr/bin/timeout 10 /bin/sh -c 'test -s /tank/sonarr/sonarr.db && test -s /tank/radarr/radarr.db || { echo "<3>nzb: sonarr.db or radarr.db is missing or empty -- refusing to start rather than letting the apps initialise a fresh library over a real one. Retrying every 30s."; exit 1; }'
+
+# No `-` prefixes on the exec lines: they record a real failure as Result=success,
+# so a genuine outage looks like a clean stop and nothing keyed on unit failure
+# fires.
 ExecStart=/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb up --remove-orphans
 
-ExecStop=/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb down --timeout 5
+# 5s was not enough. sabnzbd needs to flush its queue state and sonarr/radarr
+# need to close SQLite databases that are 210 MB and 58 MB; a SIGKILL mid-write
+# is how a library database gets corrupted, and this stack has six of them
+# stopping at once.
+ExecStop=/usr/bin/docker compose --file /opt/nzb/compose.yml --project-name nzb down --timeout 30
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

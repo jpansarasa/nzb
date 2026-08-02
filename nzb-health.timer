@@ -1,0 +1,12 @@
+[Unit]
+Description=NZB stack liveness check every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+# The stack takes a couple of minutes to settle after a restart; without this a
+# check can fire mid-startup and "fix" something that was already coming up.
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
