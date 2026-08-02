@@ -100,6 +100,33 @@ Note Docker publishes ports by DNAT ahead of the INPUT chain, so a host firewall
 does not cover these without an explicit `DOCKER-USER` rule. Binding one address
 is the control that actually applies.
 
+## Identities
+
+Every service has its own host account, and the container `PUID`/`PGID` match it
+exactly. `PGID` is the shared `media` group (1500) for everything that touches
+the media or download trees; ombi uses its own group because it touches neither.
+
+| Service | uid | gid | Host account |
+| --- | --- | --- | --- |
+| ombi | 2000 | 2000 | ombi |
+| sonarr | 2001 | 1500 | sonarr |
+| radarr | 2002 | 1500 | radarr |
+| sabnzbd | 2003 | 1500 | sabnzbd |
+| tdarr, tdarr-node | 2005 | 1500 | tdarr |
+
+(2004 is plex, in `/opt/plex`.)
+
+**tdarr used to run as 2001 — sonarr's uid — with no `tdarr` account existing.**
+Everything it wrote to the shared trees was therefore owned by `sonarr`, so
+ownership could not distinguish the two. Sonarr's config dataset is not mounted
+into tdarr, so its API key was never reachable; the problem was identity on the
+shared trees, not config access. It now has uid 2005 and owns `/tank/tdarr` and
+`/var/tdarr`.
+
+`install` asserts every one of these rather than only creating them, because an
+account at the wrong uid produces a container that cannot read its own config —
+a failure that shows up at runtime rather than at deploy time.
+
 ## The media contract
 
 This repo owns the services that **write** `/export/tv` and `/export/movies`, so
@@ -120,6 +147,19 @@ group-writable (this stack) *and* world-readable (Plex). Leaving it to the image
 default made a contract two repos depend on into an accident of which image
 happened to ship which default.
 
+The umask is only half of it, though. Sonarr and Radarr both have
+`setPermissionsLinux` enabled and apply their own `chmodFolder` on import, which
+overrides whatever the umask produced — and the two were **set differently**:
+Sonarr at `755`, Radarr at `775`. That is not cosmetic. Sonarr's setting strips
+group-write, and it had produced 13,470 files on `/export/tv` at `0644` against
+11,833 at `0664` — so roughly half the TV library could not be modified by any
+other member of the `media` group. Radarr's `775` was correct. Sonarr is now
+`775` to match, and the existing drift has been repaired. Both set `chownGroup`
+to 1500, which was already right.
+
+Check them together if either is ever changed; a umask and a `chmodFolder` that
+disagree is a silent, slow divergence rather than an error.
+
 ### The download handoff tree
 
 `/tank/downloads` is `2775` with the setgid bit, and `install` repairs group
@@ -132,6 +172,19 @@ group-write became unwritable to everyone but sabnzbd. Sonarr logged 183
 `UnauthorizedAccessException` failures across 51 log files against its recycle
 bin as a direct result. What makes a shared tree work is the group plus setgid,
 so new directories inherit `media`, not a uniform owner.
+
+### A note on hardlinks
+
+Both Sonarr and Radarr have `copyUsingHardlinks` enabled, and it never takes
+effect. `/tank/downloads` and `/export/{tv,movies}` are separate ZFS datasets,
+which are separate filesystems, so a hardlink across them fails `EXDEV` and both
+apps silently fall back to a full copy — confirmed by test, and by the fact that
+no file under `/export/tv` has a link count above 1.
+
+It is left enabled deliberately: it costs nothing, and it would start working if
+the layout ever changed. But be aware that every import copies the whole file
+rather than linking it, which doubles the write and means a recycled file is a
+full second copy rather than a reference.
 
 ## One unit, six services
 

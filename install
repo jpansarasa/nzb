@@ -27,7 +27,16 @@ IMAGE_ENV_SRC=/tank/nzb/images.env
 IMAGE_ENV=/etc/nzb/images.env
 
 # name:uid pairs. The uids are hardcoded in compose.yml as PUID/PGID.
-ACCOUNTS=(ombi:2000 sonarr:2001 radarr:2002 sabnzbd:2003)
+# tdarr is 2005, not 2001. It used to run as PUID=2001 with no account of its
+# own -- i.e. as sonarr. To be accurate about what that did and did not mean:
+# sonarr's config dataset is NOT mounted into the tdarr containers, so tdarr
+# could not read sonarr.db or its API key. What it did mean is that tdarr had no
+# separate identity on the host at all: everything it wrote to the shared media
+# trees was owned by `sonarr`, so ownership could not distinguish the two, and a
+# compromise of tdarr -- a service with NO authentication of any kind, see the
+# ports section of the README -- would act as sonarr on every file it touched.
+# 2005 was the next free uid in this host's 2000-block.
+ACCOUNTS=(ombi:2000 sonarr:2001 radarr:2002 sabnzbd:2003 tdarr:2005)
 # Datasets holding app state, snapshotted monthly. downloads is deliberately
 # excluded -- see step 2.
 CONFIG_DATASETS=(ombi sonarr radarr sabnzbd tdarr nzb)
@@ -78,7 +87,7 @@ if ! getent group media >/dev/null; then
 fi
 [ "$(getent group media | cut -d: -f3)" = "$MEDIA_GID" ] ||
     die "group media is gid $(getent group media | cut -d: -f3), expected $MEDIA_GID (compose.yml sets PGID=$MEDIA_GID)"
-for u in sonarr radarr sabnzbd; do
+for u in sonarr radarr sabnzbd tdarr; do
     usermod --append --groups media "$u"      # no-op if already a member
 done
 
@@ -145,15 +154,14 @@ chown ombi:ombi    /tank/ombi
 chown sonarr:media /tank/sonarr
 chown radarr:media /tank/radarr
 chown sabnzbd:media /tank/sabnzbd
-chown sonarr:media /tank/tdarr
 mkdir -p /tank/tdarr/server /tank/tdarr/configs /tank/tdarr/logs
-chown sonarr:media /tank/tdarr/server /tank/tdarr/configs /tank/tdarr/logs
+chown -R tdarr:media /tank/tdarr
 
 #    tdarr's transcode scratch, deliberately on the NVMe rather than the pool.
 #    Nothing used to create it, so on a fresh machine docker made it root:root
 #    and tdarr (2001) could not write there.
 mkdir -p "$TDARR_TEMP"
-chown sonarr:media "$TDARR_TEMP"
+chown tdarr:media "$TDARR_TEMP"
 
 # 4. The shared handoff tree. This replaces `chown -R sabnzbd:media /tank/downloads`,
 #    which was both expensive (692 GB, every run) and actively harmful: it rewrote

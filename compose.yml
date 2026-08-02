@@ -106,7 +106,12 @@ services:
     container_name: tdarr
     hostname: tdarr
     environment:
-      - PUID=2001
+      # 2005, its own uid. It used to be 2001 -- sonarr's -- with no tdarr
+      # account existing at all, so everything tdarr wrote to the shared media
+      # trees was owned by `sonarr` and ownership could not tell them apart.
+      # (Sonarr's config dataset is not mounted here, so its API key was never
+      # reachable; the issue was identity on the shared trees, not config access.)
+      - PUID=2005
       - PGID=1500
       - TZ=America/New_York
       - UMASK_SET=002
@@ -139,7 +144,7 @@ services:
   tdarr-node:
     image: ghcr.io/haveagitgat/tdarr_node:${TDARR_TAG:-latest}
     environment:
-      - PUID=2001
+      - PUID=2005
       - PGID=1500
       - TZ=America/New_York
       - UMASK_SET=002
