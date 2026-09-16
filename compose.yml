@@ -141,8 +141,16 @@ services:
       retries: 3
       start_period: 2m
 
-  tdarr-node:
+  # Two named services instead of one `deploy: replicas: 2`. A replicated
+  # service has nowhere per-instance to persist /app/configs, so each node's
+  # identity (nodeID) and worker schedule were regenerated from scratch on
+  # every container restart -- every restart silently zeroed the worker
+  # limits back to 0, which is why nothing had actually been transcoded since
+  # 2026-02-01 despite the library and plugin settings looking correct.
+  tdarr-node-1:
     image: ghcr.io/haveagitgat/tdarr_node:${TDARR_TAG:-latest}
+    container_name: tdarr-node-1
+    hostname: tdarr-node-1
     environment:
       - PUID=2005
       - PGID=1500
@@ -151,14 +159,35 @@ services:
       - serverIP=tdarr
       - serverPort=8266
     volumes:
+      - tdarr_node1_configs:/app/configs
       - /var/tdarr:/temp
       - tv:/media/tv
       - movies:/media/movies
-    deploy:
-      replicas: 2
     # Transcoding is the one workload here that legitimately wants headroom, so
     # this ceiling is generous. It exists to stop a runaway node competing with
     # ntfy, which is this host's alert channel, not to ration normal work.
+    mem_limit: 6g
+    security_opt: [ "no-new-privileges:true" ]
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
+    depends_on:
+      - tdarr
+
+  tdarr-node-2:
+    image: ghcr.io/haveagitgat/tdarr_node:${TDARR_TAG:-latest}
+    container_name: tdarr-node-2
+    hostname: tdarr-node-2
+    environment:
+      - PUID=2005
+      - PGID=1500
+      - TZ=America/New_York
+      - UMASK_SET=002
+      - serverIP=tdarr
+      - serverPort=8266
+    volumes:
+      - tdarr_node2_configs:/app/configs
+      - /var/tdarr:/temp
+      - tv:/media/tv
+      - movies:/media/movies
     mem_limit: 6g
     security_opt: [ "no-new-privileges:true" ]
     logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
@@ -213,6 +242,12 @@ volumes:
   tdarr_logs:
     driver: local
     driver_opts: { device: /tank/tdarr/logs, o: bind, type: none }
+  tdarr_node1_configs:
+    driver: local
+    driver_opts: { device: /tank/tdarr/node1-configs, o: bind, type: none }
+  tdarr_node2_configs:
+    driver: local
+    driver_opts: { device: /tank/tdarr/node2-configs, o: bind, type: none }
   ombi:
     driver: local
     driver_opts: { device: /tank/ombi, o: bind, type: none }
