@@ -1,0 +1,95 @@
+[
+    {
+        "name": "JP Fix Incompatible Playback",
+        "description": "Fix VC-1/AV1/VP9 video and TrueHD audio tracks that fail to play on some Plex clients. Uses the Flow engine's Replace Original File (more reliable than the classic plugin stack's implicit replace).",
+        "tags": "",
+        "flowPlugins": [
+            {
+                "name": "Input File",
+                "sourceRepo": "Community",
+                "pluginName": "inputFile",
+                "version": "1.0.0",
+                "id": "n1input",
+                "position": {
+                    "x": 100,
+                    "y": 100
+                }
+            },
+            {
+                "name": "Begin Command",
+                "sourceRepo": "Community",
+                "pluginName": "ffmpegCommandStart",
+                "version": "1.0.0",
+                "id": "n2start",
+                "position": {
+                    "x": 100,
+                    "y": 220
+                }
+            },
+            {
+                "name": "Check And Fix Incompatible Playback",
+                "sourceRepo": "Local",
+                "pluginName": "checkFixIncompatiblePlayback",
+                "version": "1.0.0",
+                "id": "n3check",
+                "position": {
+                    "x": 100,
+                    "y": 340
+                }
+            },
+            {
+                "name": "Execute",
+                "sourceRepo": "Community",
+                "pluginName": "ffmpegCommandExecute",
+                "version": "1.0.0",
+                "id": "n4exec",
+                "position": {
+                    "x": 100,
+                    "y": 460
+                }
+            },
+            {
+                "name": "Replace Original File",
+                "sourceRepo": "Community",
+                "pluginName": "replaceOriginalFile",
+                "version": "1.0.0",
+                "id": "n5replace",
+                "position": {
+                    "x": 100,
+                    "y": 580
+                }
+            }
+        ],
+        "flowEdges": [
+            {
+                "source": "n1input",
+                "sourceHandle": "1",
+                "target": "n2start",
+                "targetHandle": null,
+                "id": "e1"
+            },
+            {
+                "source": "n2start",
+                "sourceHandle": "1",
+                "target": "n3check",
+                "targetHandle": null,
+                "id": "e2"
+            },
+            {
+                "source": "n3check",
+                "sourceHandle": "1",
+                "target": "n4exec",
+                "targetHandle": null,
+                "id": "e3"
+            },
+            {
+                "source": "n4exec",
+                "sourceHandle": "1",
+                "target": "n5replace",
+                "targetHandle": null,
+                "id": "e4"
+            }
+        ],
+        "_id": "jp01fixflow"
+    }
+]
