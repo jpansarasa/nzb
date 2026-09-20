@@ -1,6 +1,6 @@
 name: nzb
 
-# Six services, one unit. Images come from the environment so a bad release can
+# Eight services, one unit. Images come from the environment so a bad release can
 # be pinned out without editing this (tracked, public) file; nzb.service sets
 # every *_TAG to latest and lets /etc/nzb/images.env override it.
 #
@@ -217,6 +217,38 @@ services:
       retries: 3
       start_period: 1m
 
+  bazarr:
+    image: lscr.io/linuxserver/bazarr:${BAZARR_TAG:-latest}
+    container_name: bazarr
+    hostname: bazarr
+    environment:
+      - PUID=2006
+      - PGID=1500
+      - TZ=America/New_York
+      - UMASK_SET=002
+    volumes:
+      - bazarr:/config
+      # Mounted at the SAME container paths Sonarr and Radarr use (/tv,
+      # /movies, not Tdarr's /media/tv, /media/movies), so Bazarr's path
+      # mapping to their libraries is a no-op.
+      - tv:/tv
+      - movies:/movies
+    ports:
+      # Bazarr's own default (6767) collides with sabnzbd's host mapping above.
+      - "${NZB_BIND_ADDR:-127.0.0.1}:6768:6767"
+    depends_on:
+      - sonarr
+      - radarr
+    security_opt: [ "no-new-privileges:true" ]
+    mem_limit: 1g
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:6767/"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 1m
+
 # NOTE: no `restart:` policy on any service, deliberately. systemd is the only
 # supervisor. With one, dockerd restarts containers behind the unit's back -- the
 # attached `compose up` never exits, so a crash-loop leaves the unit green and
@@ -251,6 +283,9 @@ volumes:
   ombi:
     driver: local
     driver_opts: { device: /tank/ombi, o: bind, type: none }
+  bazarr:
+    driver: local
+    driver_opts: { device: /tank/bazarr, o: bind, type: none }
   downloads:
     driver: local
     driver_opts: { device: /tank/downloads, o: bind, type: none }

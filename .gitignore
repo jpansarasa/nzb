@@ -18,3 +18,4 @@ secrets.env
 
 # `install` additionally refuses to run if it finds a credential-shaped file in
 # this directory, because no pattern list catches every name someone might use.
+.opensubtitles

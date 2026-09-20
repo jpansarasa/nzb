@@ -1,5 +1,5 @@
 [Unit]
-Description=NZB container stack (sabnzbd, sonarr, radarr, tdarr, ombi)
+Description=NZB container stack (sabnzbd, sonarr, radarr, tdarr, ombi, bazarr)
 
 # Wants=, NOT Requires=. A failed Requires= dependency aborts the START JOB: the
 # unit never enters start, Restart= is never armed, and it sits at inactive/dead
@@ -38,7 +38,7 @@ RestartSec=30
 # (measured on this host), and tank is failmode=wait, so pointing it at the pool
 # would let a faulted pool wedge PID 1. install filters the render to the known
 # keys, so nothing else in the source file can reach this unit's environment.
-Environment=SABNZBD_TAG=latest SONARR_TAG=latest RADARR_TAG=latest TDARR_TAG=latest OMBI_TAG=latest
+Environment=SABNZBD_TAG=latest SONARR_TAG=latest RADARR_TAG=latest TDARR_TAG=latest OMBI_TAG=latest BAZARR_TAG=latest
 EnvironmentFile=-/etc/nzb/images.env
 
 # There is deliberately NO `docker compose pull` here. It used to be an
@@ -60,7 +60,7 @@ EnvironmentFile=-/etc/nzb/images.env
 # nowhere, and sonarr/radarr would come up with an EMPTY library database and
 # start treating a full library as missing. -C keeps findmnt from canonicalizing
 # (it would readlink() /tank, and tank is failmode=wait).
-ExecStartPre=/bin/sh -c 'for d in sabnzbd sonarr radarr ombi downloads tdarr; do /usr/bin/findmnt -C --type zfs --source "tank/$d" --mountpoint "/tank/$d" --noheadings >/dev/null || { echo "<3>nzb: tank/$d is NOT mounted at /tank/$d -- refusing to start, because the stack would bind an empty directory and the apps would treat their state as missing. Retrying every 30s."; exit 1; }; done'
+ExecStartPre=/bin/sh -c 'for d in sabnzbd sonarr radarr ombi downloads tdarr bazarr; do /usr/bin/findmnt -C --type zfs --source "tank/$d" --mountpoint "/tank/$d" --noheadings >/dev/null || { echo "<3>nzb: tank/$d is NOT mounted at /tank/$d -- refusing to start, because the stack would bind an empty directory and the apps would treat their state as missing. Retrying every 30s."; exit 1; }; done'
 
 # The media datasets, bound READ-WRITE into sonarr, radarr and both tdarr nodes.
 # Unmounted, these bind to empty directories on the root filesystem: sonarr and
