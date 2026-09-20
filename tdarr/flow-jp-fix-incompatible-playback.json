@@ -1,7 +1,7 @@
 [
     {
         "name": "JP Fix Incompatible Playback",
-        "description": "Fix VC-1/AV1/VP9 video and TrueHD audio tracks that fail to play on some Plex clients. Uses the Flow engine's Replace Original File (more reliable than the classic plugin stack's implicit replace).",
+        "description": "Fix VC-1/AV1/VP9 video and TrueHD audio tracks that fail to play on some Plex clients. Uses the Flow engine's Replace Original File (more reliable than the classic plugin stack's implicit replace). Files with no problem streams are routed past Execute/Replace instead of going through a no-op remux-and-swap.",
         "tags": "",
         "flowPlugins": [
             {
@@ -38,6 +38,17 @@
                 }
             },
             {
+                "name": "Route If Should Process",
+                "sourceRepo": "Local",
+                "pluginName": "routeIfShouldProcess",
+                "version": "1.0.0",
+                "id": "n3route",
+                "position": {
+                    "x": 100,
+                    "y": 460
+                }
+            },
+            {
                 "name": "Execute",
                 "sourceRepo": "Community",
                 "pluginName": "ffmpegCommandExecute",
@@ -45,7 +56,7 @@
                 "id": "n4exec",
                 "position": {
                     "x": 100,
-                    "y": 460
+                    "y": 580
                 }
             },
             {
@@ -56,7 +67,7 @@
                 "id": "n5replace",
                 "position": {
                     "x": 100,
-                    "y": 580
+                    "y": 700
                 }
             }
         ],
@@ -77,6 +88,13 @@
             },
             {
                 "source": "n3check",
+                "sourceHandle": "1",
+                "target": "n3route",
+                "targetHandle": null,
+                "id": "e2b"
+            },
+            {
+                "source": "n3route",
                 "sourceHandle": "1",
                 "target": "n4exec",
                 "targetHandle": null,
