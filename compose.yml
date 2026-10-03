@@ -163,6 +163,13 @@ services:
       - /var/tdarr:/temp
       - tv:/media/tv
       - movies:/media/movies
+    # The host iGPU (UHD P630). The TV flow's Dolby Vision Profile 5 -> HDR10
+    # conversion runs libplacebo on Vulkan and encodes with hevc_qsv; without
+    # this, Vulkan falls back to lavapipe on the CPU at ~3 fps instead of ~10.
+    # No group_add: the image's 02-hw-transcoding init adds abc to the device's
+    # group itself. Plex uses the same device concurrently.
+    devices:
+      - /dev/dri:/dev/dri
     # Transcoding is the one workload here that legitimately wants headroom, so
     # this ceiling is generous. It exists to stop a runaway node competing with
     # ntfy, which is this host's alert channel, not to ration normal work.
@@ -188,6 +195,8 @@ services:
       - /var/tdarr:/temp
       - tv:/media/tv
       - movies:/media/movies
+    devices:
+      - /dev/dri:/dev/dri
     mem_limit: 6g
     security_opt: [ "no-new-privileges:true" ]
     logging: { driver: json-file, options: { max-size: 10m, max-file: "3" } }

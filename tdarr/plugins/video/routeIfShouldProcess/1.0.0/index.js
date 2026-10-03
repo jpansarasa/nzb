@@ -1,7 +1,7 @@
 const details = () => ({
   name: 'Route If Should Process',
   description: `Checks ffmpegCommand.shouldProcess after "Check And Fix Incompatible Playback". A file
-                with no VC-1/AV1/VP9 video or TrueHD audio streams leaves shouldProcess unset, so this
+                with no VC-1/AV1/VP9 or Dolby Vision Profile 5 video and no TrueHD audio leaves shouldProcess unset, so this
                 routes it past Execute and Replace Original File instead of running it through a no-op
                 remux-and-swap. Must run after "Check And Fix Incompatible Playback" and before
                 "Execute".`,
@@ -36,7 +36,7 @@ const plugin = (args) => {
   const shouldProcess = !!(args.variables.ffmpegCommand && args.variables.ffmpegCommand.shouldProcess);
 
   if (!shouldProcess) {
-    args.jobLog('No VC-1/AV1/VP9/TrueHD streams found, nothing to fix - skipping Execute and Replace Original File.');
+    args.jobLog('No VC-1/AV1/VP9/DV-Profile-5/TrueHD streams found, nothing to fix - skipping Execute and Replace Original File.');
   }
 
   return {

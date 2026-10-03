@@ -14,6 +14,23 @@ only those specific tracks (video -> H.264, TrueHD audio -> EAC3 5.1) and
 stream-copies everything else, so the fix is narrow -- it never touches files
 that don't have one of these tracks.
 
+**Dolby Vision Profile 5** (added 2026-10-03) is the one case that isn't about
+the codec. P5 is HEVC Main 10, but its base layer is in Dolby's IPTPQc2 colour
+space with no HDR10 fallback, so the Shield shows purple/green or Plex fails to
+transcode it. Profiles 7 and 8.x carry an HDR10-compatible base layer and are
+left alone. A P5 video stream (detected from the `DOVI configuration record`
+in ffprobe's `side_data_list`) is converted to plain HDR10 HEVC: libplacebo
+applies the RPU and converts to BT.2020/PQ on the iGPU via Vulkan, and
+`hevc_qsv` encodes at 18 Mbps VBR. Audio and subtitles are still copied. This
+needs `/dev/dri` in the tdarr-node containers (see `compose.yml`); without it
+Vulkan silently falls back to lavapipe on the CPU at ~3 fps. With it, a 50-min
+4K episode takes ~2 h (~10 fps; decode stays on the CPU because the P630 has
+no Vulkan video decode). DV is lost -- the output is HDR10 only -- which is the
+trade for it playing everywhere. Sonarr's `DV without HDR10 fallback
+(Profile 5)` custom format (-1000) keeps these from being grabbed when any
+other release of the same quality exists, and upgrades the ones that slip
+through; this conversion is the fallback for when nothing else is available.
+
 It runs on the **Flow** engine, not Tdarr's classic plugin stack. The classic
 engine's implicit "replace original file" step turned out to be unreliable on
 this install (ffmpeg would succeed but the file was never actually replaced --
@@ -44,7 +61,7 @@ to `Execute` when something was actually flagged.
   `/tank/tdarr/server/Tdarr/Plugins/FlowPlugins/LocalFlowPlugins/video/routeIfShouldProcess/1.0.0/index.js`.
   Runs right after "Check And Fix Incompatible Playback" and reads
   `args.variables.ffmpegCommand.shouldProcess`: output 1 (still needs a fix)
-  continues to "Execute"; output 2 (no VC-1/AV1/VP9/TrueHD streams found) has
+  continues to "Execute"; output 2 (no VC-1/AV1/VP9/DV-P5/TrueHD streams found) has
   no outgoing edge, so the file is left untouched instead of being run through
   a no-op remux + Replace Original File.
 
