@@ -4,7 +4,8 @@ const details = () => ({
   description: `Marks VC-1/AV1/VP9 video streams for re-encode to H.264, Dolby Vision Profile 5
                 video for conversion to HDR10 HEVC, and TrueHD/Atmos audio streams for re-encode
                 to EAC3 (640k). Every other stream is left as-is (Execute defaults untouched
-                streams to stream copy). Must run after "Begin Command" and before "Execute".`,
+                streams to stream copy). Must run after "Begin Command" and before "Execute".
+                Each fix can be switched off per flow (the Movies flow only converts DV Profile 5).`,
   style: {
     borderColor: '#6efefc',
   },
@@ -14,7 +15,29 @@ const details = () => ({
   requiresVersion: '2.11.01',
   sidebarPosition: -1,
   icon: '',
-  inputs: [],
+  inputs: [
+    {
+      label: 'Fix legacy codecs',
+      name: 'fixLegacyCodecs',
+      type: 'boolean',
+      defaultValue: 'true',
+      inputUI: {
+        type: 'switch',
+      },
+      tooltip: 'Re-encode VC-1/AV1/VP9 video to H.264 and TrueHD audio to EAC3. Off for Movies:'
+        + ' remuxes would lose lossless Atmos, and the Shield plays TrueHD and VC-1 natively.',
+    },
+    {
+      label: 'Convert Dolby Vision Profile 5',
+      name: 'fixDolbyVision5',
+      type: 'boolean',
+      defaultValue: 'true',
+      inputUI: {
+        type: 'switch',
+      },
+      tooltip: 'Convert DV Profile 5 video (no HDR10 fallback) to HDR10 HEVC on the iGPU.',
+    },
+  ],
   outputs: [
     {
       number: 1,
@@ -47,6 +70,7 @@ const plugin = (args) => {
   args.inputs = lib.loadDefaultValues(args.inputs, details);
 
   const PROBLEM_VIDEO_CODECS = ['vc1', 'av1', 'vp9'];
+  const { fixLegacyCodecs, fixDolbyVision5 } = args.inputs;
   const streams = (args.variables.ffmpegCommand && args.variables.ffmpegCommand.streams) || [];
   let vulkanDeviceAdded = false;
 
@@ -56,7 +80,7 @@ const plugin = (args) => {
       // eslint-disable-next-line no-continue
       continue;
     }
-    if (stream.codec_type === 'video' && PROBLEM_VIDEO_CODECS.includes(stream.codec_name)) {
+    if (fixLegacyCodecs && stream.codec_type === 'video' && PROBLEM_VIDEO_CODECS.includes(stream.codec_name)) {
       stream.outputArgs.push(
         '-c:{outputIndex}', 'libx264',
         '-preset', 'medium',
@@ -68,7 +92,7 @@ const plugin = (args) => {
       // vp8/vp9/av1), so force mkv whenever we're changing the video codec.
       args.variables.ffmpegCommand.container = 'mkv';
       args.jobLog(`Video stream ${i} is ${stream.codec_name}, marking for re-encode to libx264 (container -> mkv).`);
-    } else if (stream.codec_type === 'video' && isDolbyVisionProfile5(stream)) {
+    } else if (fixDolbyVision5 && stream.codec_type === 'video' && isDolbyVisionProfile5(stream)) {
       // Execute prepends every stream's inputArgs before -i, so the device
       // must only be declared once even if a file had two such streams.
       if (!vulkanDeviceAdded) {
@@ -86,7 +110,7 @@ const plugin = (args) => {
       args.variables.ffmpegCommand.shouldProcess = true;
       args.jobLog(`Video stream ${i} is Dolby Vision Profile 5 (no HDR10 fallback), marking for conversion to HDR10 HEVC.`);
     }
-    if (stream.codec_type === 'audio' && stream.codec_name === 'truehd') {
+    if (fixLegacyCodecs && stream.codec_type === 'audio' && stream.codec_name === 'truehd') {
       stream.outputArgs.push(
         '-c:{outputIndex}', 'eac3',
         '-b:{outputIndex}', '640k',

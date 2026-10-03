@@ -69,10 +69,24 @@ to `Execute` when something was actually flagged.
   itself (`FlowsJSONDB` doc id `jp01fixflow`), which wires these plugins into:
   `Input File -> Begin Command -> Check And Fix Incompatible Playback -> Route If Should Process -> Execute -> Replace Original File`.
   Assigned to the TV library via its `flowId` field, with
-  `decisionMaker.settingsFlows: true` / `settingsPlugin: false`. (The Movies
-  library's `LibrarySettingsJSONDB` entry has no `flowId` and
-  `processTranscodes: false` -- it's still on `settingsPlugin: true` and
-  dormant, despite what an earlier version of this note implied.)
+  `decisionMaker.settingsFlows: true` / `settingsPlugin: false`.
+
+- `flow-jp-movies-dv5.json` -- the Movies library's Flow (`FlowsJSONDB` doc
+  id `jp02moviesdv5`, added 2026-10-03). Same graph, but the check plugin's
+  `fixLegacyCodecs` input is `false`, so only DV Profile 5 is converted.
+  The full fix set would have rewritten 171 movies (~5.1 TB), turning
+  TrueHD/Atmos remuxes into lossy EAC3 without Atmos and re-encoding VC-1
+  to H.264 -- all things the Shield plays natively.
+
+Both libraries set `foldersToIgnore: ".tdarr_cache"`. The cache lives inside
+each library (see step 4 below), and without this the hourly scan picked up
+an in-progress transcode's temp file and queued it as a library file.
+
+The server-side scan currently stores only a lean `ffProbeData` (codec,
+type, size -- no `index`, no `side_data_list`) for records it creates, so
+the DB alone can't be used to find DV Profile 5 files. That doesn't affect
+processing: each transcode worker re-scans the file on the node before the
+flow runs, and the plugins see full ffprobe data.
 
 ## Redeploying from scratch
 
@@ -85,7 +99,10 @@ If `tank/tdarr` is ever lost without a ZFS snapshot to restore from:
 2. Recreate the Flow: `POST /api/v2/cruddb` with
    `{"data":{"collection":"FlowsJSONDB","mode":"insert","docID":"jp01fixflow","obj":<contents of flow-jp-fix-incompatible-playback.json, minus the array wrapper>}}`.
 3. On the TV library (`LibrarySettingsJSONDB`), set `flowId: "jp01fixflow"` and
-   `decisionMaker.settingsFlows: true` / `settingsPlugin: false`.
+   `decisionMaker.settingsFlows: true` / `settingsPlugin: false`. Same for the
+   Movies library with `flowId: "jp02moviesdv5"` (recreate that Flow from
+   `flow-jp-movies-dv5.json` as in step 2). Set `foldersToIgnore:
+   ".tdarr_cache"` on both.
 4. Point each library's `cache`/`output` at a folder *inside* that library's
    own media path (e.g. `/media/tv/.tdarr_cache`) rather than `/temp` --
    `/temp` is a different filesystem (the host's `/var`, not `tank`), and a
